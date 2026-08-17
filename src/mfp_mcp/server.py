@@ -55,7 +55,13 @@ COOKIES_FILE = CONFIG_DIR / "cookies.json"
 # endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
 MFP_API_BASE = "https://api.myfitnesspal.com"
 MFP_CLIENT_ID = "mfp-main-js"
+# MyFitnessPal's factory meal names. An account that has renamed its meals has
+# its own names instead, and the diary API only honours the account's actual
+# names - see resolve_meal_name().
 VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
+
+# Cache of the account's configured meal names, keyed by user id.
+_MEAL_NAMES_CACHE: Dict[str, List[str]] = {}
 
 
 # ============================================================================
@@ -1098,7 +1104,12 @@ class AddFoodToDiaryInput(BaseModel):
     )
     meal: str = Field(
         default="Breakfast",
-        description="Meal name (e.g., 'Breakfast', 'Lunch', 'Dinner', 'Snacks')",
+        description=(
+            "Meal/section name. Defaults are 'Breakfast', 'Lunch', 'Dinner', "
+            "'Snacks', but an account that renamed its diary sections must use "
+            "its own names instead (case-insensitive). An unknown name is an "
+            "error rather than a silent misfile."
+        ),
     )
     date: Optional[str] = Field(
         default=None,
@@ -1229,7 +1240,8 @@ class RemoveFoodFromDiaryInput(BaseModel):
     meal: Optional[str] = Field(
         default=None,
         description=(
-            "Restrict matching to a meal: Breakfast, Lunch, Dinner, Snacks."
+            "Restrict matching to one meal/section. Defaults are Breakfast, "
+            "Lunch, Dinner, Snacks; a renamed account uses its own names."
         ),
     )
     max_matches: int = Field(
@@ -1577,6 +1589,85 @@ def delete_custom_food(client, food_id: str) -> int:
     return r.status_code
 
 
+def get_account_meal_names(client, refresh: bool = False) -> List[str]:
+    """
+    Return the meal/section names this account actually uses.
+
+    MyFitnessPal lets an account rename its four diary sections, and the diary
+    API resolves entries by that stored name. An account whose sections are
+    "Daily Staples / Dinner / Smoothie / Extra" cannot be written to with
+    "Breakfast"; unrecognised names silently land in a default section rather
+    than erroring, which makes this the difference between a correct log and a
+    misfiled one.
+
+    Falls back to the factory names if the preference read fails, which is the
+    right answer for any account that never renamed its meals.
+    """
+    key = str(client.user_id)
+    if not refresh and key in _MEAL_NAMES_CACHE:
+        return _MEAL_NAMES_CACHE[key]
+
+    names: List[str]
+    try:
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/users/{client.user_id}",
+            params={"fields[]": "diary_preferences"},
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        response.raise_for_status()
+        names = list(response.json()["item"]["diary_preferences"]["meal_names"])
+        if not names:
+            raise ValueError("empty meal_names")
+    except Exception as exc:  # noqa: BLE001 - any failure means fall back
+        logger.warning(f"Could not read account meal names ({exc}); using defaults")
+        names = list(VALID_MEALS)
+
+    _MEAL_NAMES_CACHE[key] = names
+    return names
+
+
+def _meal_key(name: str) -> str:
+    """
+    Fold a meal name to a comparable key.
+
+    MyFitnessPal stores non-breaking spaces inside renamed meals - this
+    account's first section is literally "Daily\\xa0Staples" - so a caller
+    typing an ordinary space must still match. Case is folded for the same
+    reason.
+    """
+    cleaned = name.replace("&nbsp;", " ").replace("\xa0", " ")
+    return " ".join(cleaned.split()).casefold()
+
+
+def resolve_meal_name(client, meal: str) -> str:
+    """
+    Map a caller-supplied meal name onto this account's real section name.
+
+    Returns the account's exact stored name, which is what the diary API
+    needs. Raises if the name matches none of the account's sections, so a
+    typo fails loudly instead of silently landing in the wrong section.
+    """
+    requested = (meal or "").strip()
+    if not requested:
+        raise RuntimeError("Meal name is required.")
+    if requested.casefold() == "snack":
+        requested = "Snacks"
+
+    wanted = _meal_key(requested)
+    for refresh in (False, True):
+        names = get_account_meal_names(client, refresh=refresh)
+        for name in names:
+            if _meal_key(name) == wanted:
+                return name
+        # A miss on the cached list may just mean the meals were renamed since
+        # it was read, so try once against a fresh read before giving up.
+
+    raise RuntimeError(
+        f"Invalid meal {meal!r}. This account's meals are: {', '.join(names)}"
+    )
+
+
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
 ) -> Optional[str]:
@@ -1600,11 +1691,7 @@ def add_food_to_diary(
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
 
-    meal_name = meal.strip().capitalize()
-    if meal_name not in VALID_MEALS:
-        raise RuntimeError(
-            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
-        )
+    meal_name = resolve_meal_name(client, meal)
 
     entry = {
         "type": "food_entry",
@@ -2348,11 +2435,12 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
-        if meal.lower() == "snack":
-            meal = "Snacks"
-        
+        # Resolve against the account's real section names. Blind
+        # .capitalize() used to mangle multi-word names ("Daily Staples" ->
+        # "Daily staples"); resolve_meal_name handles case and the
+        # non-breaking spaces MyFitnessPal stores inside renamed meals.
+        meal = resolve_meal_name(client, params.meal)
+
         # Add food to diary
         entry_id = add_food_to_diary(
             client=client,
@@ -2443,15 +2531,16 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
         entries = list_diary_entries(client, target_date)
         needle = params.name_contains.lower()
-        meal_filter = (
-            params.meal.lower() if params.meal else None
-        )
+        # Fold the meal filter the same way the diary's own names are folded,
+        # so a renamed section with a non-breaking space in it ("Daily Staples")
+        # can be targeted with an ordinary space.
+        meal_filter = _meal_key(params.meal) if params.meal else None
 
         matches = []
         for e in entries:
             if needle not in e["name"].lower():
                 continue
-            if meal_filter and meal_filter not in e["meal"].lower():
+            if meal_filter and meal_filter != _meal_key(e["meal"]):
                 continue
             matches.append(e)
 
