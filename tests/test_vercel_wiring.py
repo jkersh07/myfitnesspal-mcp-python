@@ -92,7 +92,8 @@ def main():
     # 2. Every tool survived the import.
     tools = asyncio.run(mfp.mcp.list_tools())
     names = sorted(t.name for t in tools)
-    check("20 tools registered", len(tools) == 20, f"got {len(tools)}")
+    check("19 tools registered (cookie refresh pruned)", len(tools) == 19, f"got {len(tools)}")
+    check("refresh_browser_cookies absent", "refresh_browser_cookies" not in names)
     for required in ("mfp_get_diary", "mfp_search_food", "mfp_add_food_to_diary", "mfp_remove_food_from_diary"):
         check(f"tool present: {required}", required in names)
 

@@ -107,6 +107,11 @@ mfp.get_mfp_client = get_mfp_client_remote
 # Transport
 # ---------------------------------------------------------------------------
 
+# The cookie-refresh tool reads a browser on the local machine; the hosted
+# copy has no browser, so calling it can only fail. Pruning it here keeps
+# server.py untouched while keeping it out of every client's tool list.
+mfp.mcp._tool_manager._tools.pop("refresh_browser_cookies", None)
+
 # Built once per process and shared. This holds the tool registry.
 _MCP_SERVER = mfp.mcp._mcp_server
 
@@ -174,38 +179,6 @@ def _original_path(scope) -> str:
     return scope.get("path", "/")
 
 
-async def _log_request(scope, note: str) -> None:
-    """Temporary diagnostic: ring-buffer each request in the session store.
-
-    Lets the operator see exactly what a connecting client (e.g. claude.ai's
-    connector prober) requested and how it was answered, without Vercel log
-    access. Reads back with LRANGE mfp:reqlog 0 49. Remove once the claude.ai
-    connect flow is proven.
-    """
-    try:
-        import httpx
-
-        url, token = remote_store._rest_credentials()
-        if not url:
-            return
-        ua = ""
-        for n, v in scope.get("headers", []):
-            if n == b"user-agent":
-                ua = v.decode(errors="ignore")[:80]
-        line = (
-            f"{scope.get('method', '?')} {_original_path(scope)[:100]} "
-            f"-> {note} ua={ua}"
-        )
-        async with httpx.AsyncClient(timeout=3) as c:
-            await c.post(
-                f"{url}/pipeline",
-                headers={"Authorization": f"Bearer {token}"},
-                json=[["LPUSH", "mfp:reqlog", line], ["LTRIM", "mfp:reqlog", "0", "49"]],
-            )
-    except Exception:
-        pass
-
-
 async def app(scope, receive, send):
     if scope["type"] == "lifespan":
         # Nothing to start or stop: each request builds its own manager.
@@ -230,16 +203,12 @@ async def app(scope, receive, send):
     # get a plain 404: a 401 here reads as "this resource is OAuth-protected"
     # and sends the client into a sign-in flow this server does not have.
     if "/.well-known/" in _original_path(scope):
-        await _log_request(scope, "404 well-known")
         await _reject(send, 404, "Not found.")
         return
 
     if not _authorized(scope):
-        await _log_request(scope, "401")
         await _reject(send, 401, "Unauthorized.")
         return
-
-    await _log_request(scope, "authorized")
 
     # Vercel routes every path to this function; the transport expects its own.
     scope = dict(scope)
