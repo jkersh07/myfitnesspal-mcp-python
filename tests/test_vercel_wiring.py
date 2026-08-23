@@ -31,14 +31,14 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}")
 
 
-async def call(headers, body=b"", path="/mcp"):
+async def call(headers, body=b"", path="/mcp", query=b""):
     scope = {
         "type": "http",
         "http_version": "1.1",
         "method": "POST",
         "path": path,
         "raw_path": path.encode(),
-        "query_string": b"",
+        "query_string": query,
         "headers": headers,
         "scheme": "https",
         "server": ("localhost", 443),
@@ -129,6 +129,13 @@ def main():
 
     status6, _ = asyncio.run(call(HDRS, INIT, path="/wrong-token/"))
     check("wrong path token rejected", status6 == 401, f"status {status6}")
+
+    # 6c. Vercel production shape: internal path, real path in __path query.
+    status7, body7 = asyncio.run(call(HDRS, INIT, path="/api/index", query=b"__path=test-token-123/"))
+    check("token via __path accepted", status7 == 200 and b"serverInfo" in body7, f"status {status7}")
+
+    status8, _ = asyncio.run(call(HDRS, INIT, path="/api/index", query=b"__path=wrong/"))
+    check("wrong __path token rejected", status8 == 401, f"status {status8}")
 
     # 7. No stored session gives a clear error, not a hang or a browser attempt.
     try:

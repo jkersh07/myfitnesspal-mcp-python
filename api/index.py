@@ -152,10 +152,26 @@ def _authorized(scope) -> bool:
             if not presented.startswith(prefix):
                 return False
             return hmac.compare_digest(presented[len(prefix):], _TOKEN)
-    first_segment = scope.get("path", "/").strip("/").split("/", 1)[0]
+    first_segment = _original_path(scope).strip("/").split("/", 1)[0]
     if first_segment:
         return hmac.compare_digest(first_segment, _TOKEN)
     return False
+
+
+def _original_path(scope) -> str:
+    """The path the caller actually requested.
+
+    Vercel's rewrite hands the function its internal path (/api/index) and
+    carries the caller's real path in the __path query parameter that
+    vercel.json adds ("destination": "/api/index?__path=$1"). Outside Vercel
+    (tests, local runs) scope["path"] is already the real one.
+    """
+    from urllib.parse import parse_qs
+
+    qs = parse_qs(scope.get("query_string", b"").decode(errors="ignore"))
+    if "__path" in qs and qs["__path"]:
+        return "/" + qs["__path"][0]
+    return scope.get("path", "/")
 
 
 async def app(scope, receive, send):
