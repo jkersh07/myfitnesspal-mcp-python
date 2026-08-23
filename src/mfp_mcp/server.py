@@ -22,7 +22,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from http.cookiejar import CookieJar, Cookie
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -1352,11 +1353,16 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
     chosen = serving_sizes[0]
     if unit:
         wanted = unit.strip().lower()
-        for size in serving_sizes:
-            size_unit = str(size.get("unit", "")).lower()
-            if size_unit == wanted or wanted in size_unit:
-                chosen = size
-                break
+        exact = [s for s in serving_sizes if str(s.get("unit", "")).lower() == wanted]
+        substring = [
+            s for s in serving_sizes if wanted in str(s.get("unit", "")).lower()
+        ]
+        candidates = exact or substring
+        if candidates:
+            # Some foods list the same unit twice (e.g. a "100 g" pack
+            # alongside a per-gram entry) - prefer value=1.0 so quantity
+            # means a literal count of `unit`, not a count of packs.
+            chosen = next((c for c in candidates if c.get("value") == 1.0), candidates[0])
         else:
             logger.warning(
                 f"Unit {unit!r} not found for food {food.get('id')}; "
@@ -1774,9 +1780,30 @@ def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
     return entries
 
 
+def remove_diary_entry_v2(client, entry_id: str) -> None:
+    """
+    Delete a food diary entry by the UUID the v2 diary API assigned it
+    (what `add_food_to_diary` returns - a different id space than the
+    legacy numeric `food_entry_id` used by `remove_food_entry`).
+    """
+    response = client.session.delete(
+        f"{MFP_API_BASE}/v2/diary/{entry_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code in (200, 204):
+        logger.info(f"Removed diary entry {entry_id}")
+        return
+    raise RuntimeError(
+        f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
+    )
+
+
 def remove_food_entry(client, entry_id: str) -> None:
     """
-    Delete a food diary entry by its food_entry_id.
+    Delete a food diary entry by its legacy numeric food_entry_id, as
+    returned by `list_diary_entries` (see `remove_diary_entry_v2` for the
+    v2 UUID case).
 
     Uses the legacy /food/remove/{id} endpoint with X-CSRF-Token from
     the diary page meta tag.
@@ -2039,39 +2066,42 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
     """
     try:
         client = get_mfp_client()
-        item = client.get_food_item_details(params.mfp_id)
+        # client.get_food_item_details() scrapes a now-client-rendered page
+        # and raises on nearly every food; get_food_v2 is the reliable path.
+        food = get_food_v2(client, params.mfp_id)
+        nutrition = food.get("nutritional_contents", {}) or {}
+        energy = nutrition.get("energy") or {}
 
         data = {
             "mfp_id": params.mfp_id,
-            "description": getattr(item, "description", "N/A"),
-            "brand_name": getattr(item, "brand_name", None),
-            "verified": getattr(item, "verified", False),
-            "calories": getattr(item, "calories", None),
+            "description": food.get("description", "N/A"),
+            "brand_name": food.get("brand_name") or None,
+            "verified": food.get("verified", False),
+            "calories": energy.get("value"),
+            # nutrition values below are per this many grams of the food
+            "nutrition_basis_grams": nutrition.get("grams"),
             "nutrition": {
-                "protein": getattr(item, "protein", None),
-                "carbohydrates": getattr(item, "carbohydrates", None),
-                "fat": getattr(item, "fat", None),
-                "fiber": getattr(item, "fiber", None),
-                "sugar": getattr(item, "sugar", None),
-                "sodium": getattr(item, "sodium", None),
-                "cholesterol": getattr(item, "cholesterol", None),
-                "saturated_fat": getattr(item, "saturated_fat", None),
-                "polyunsaturated_fat": getattr(item, "polyunsaturated_fat", None),
-                "monounsaturated_fat": getattr(item, "monounsaturated_fat", None),
-                "trans_fat": getattr(item, "trans_fat", None),
-                "potassium": getattr(item, "potassium", None),
-                "vitamin_a": getattr(item, "vitamin_a", None),
-                "vitamin_c": getattr(item, "vitamin_c", None),
-                "calcium": getattr(item, "calcium", None),
-                "iron": getattr(item, "iron", None),
+                "protein": nutrition.get("protein"),
+                "carbohydrates": nutrition.get("carbohydrates"),
+                "fat": nutrition.get("fat"),
+                "fiber": nutrition.get("fiber"),
+                "sugar": nutrition.get("sugar"),
+                "sodium": nutrition.get("sodium"),
+                "cholesterol": nutrition.get("cholesterol"),
+                "saturated_fat": nutrition.get("saturated_fat"),
+                "polyunsaturated_fat": nutrition.get("polyunsaturated_fat"),
+                "monounsaturated_fat": nutrition.get("monounsaturated_fat"),
+                "trans_fat": nutrition.get("trans_fat"),
+                "potassium": nutrition.get("potassium"),
+                "vitamin_a": nutrition.get("vitamin_a"),
+                "vitamin_c": nutrition.get("vitamin_c"),
+                "calcium": nutrition.get("calcium"),
+                "iron": nutrition.get("iron"),
             },
-            "servings": [],
+            "servings": [
+                f"{s['value']} {s['unit']}" for s in food.get("serving_sizes", [])
+            ],
         }
-
-        # Get serving sizes if available
-        if hasattr(item, "servings"):
-            for serving in item.servings:
-                data["servings"].append(str(serving))
 
         return format_response(data, params.response_format, "Food Item Details")
 
@@ -2115,7 +2145,37 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = client.get_measurements(params.measurement, start, end)
+        # client.get_measurements() scrapes a "dehydratedState" key that no
+        # longer exists on the (now client-rendered) page - KeyErrors every
+        # call. The v2 endpoint below works, but its begin_date/end_date/type
+        # params don't actually filter server-side, so we filter here.
+        response = client.session.get(
+            f"{MFP_API_BASE}/v2/measurements",
+            params={
+                "type": params.measurement,
+                "begin_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
+            },
+            headers=_mfp_api_headers(client),
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Could not fetch measurements: HTTP {response.status_code}"
+            )
+
+        wanted_type = params.measurement.strip().lower()
+        measurements: OrderedDict[str, float] = OrderedDict(
+            sorted(
+                (
+                    (item["date"], float(item["value"]))
+                    for item in response.json().get("items", [])
+                    if item.get("type", "").strip().lower() == wanted_type
+                    and start <= parse_date(item["date"]) <= end
+                ),
+                key=lambda pair: pair[0],
+            )
+        )
 
         data = {
             "measurement_type": params.measurement,
@@ -2451,10 +2511,8 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             unit=params.unit,
         )
 
-        # Get food details for confirmation
         try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
+            food_name = get_food_v2(client, params.mfp_id).get("description", "Food item")
         except Exception:
             food_name = "Food item"
 
@@ -2493,8 +2551,9 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Two modes:
 
-    1. By entry_id (precise): delete exactly the entry whose
-       food_entry_id matches. Use this when you already know the ID.
+    1. By entry_id (precise): delete exactly the entry whose id matches -
+       this is the UUID `mfp_add_food_to_diary` returned when you logged it.
+       Use this when you already know the ID.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
@@ -2502,7 +2561,8 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:
-            - entry_id: exact food_entry_id to delete
+            - entry_id: the entry's UUID, as returned by
+              mfp_add_food_to_diary (NOT a food_entry_id from the diary page)
             - name_contains: substring match against entry names
             - meal: restrict matching to one meal
             - max_matches: safety cap for fuzzy matches (default 1)
@@ -2515,9 +2575,9 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
 
-        # Mode 1: delete a single entry by ID
+        # Mode 1: delete a single entry by its v2 UUID (what add returns)
         if params.entry_id:
-            remove_food_entry(client, params.entry_id)
+            remove_diary_entry_v2(client, params.entry_id)
             return json.dumps({
                 "success": True,
                 "removed": [{"entry_id": params.entry_id}],
@@ -2939,6 +2999,336 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         return format_response(data, params.response_format, "Custom Food Deleted")
     except Exception as e:
         return f"Error deleting custom food: {str(e)}"
+
+
+# ============================================================================
+# Fasting (Intermittent) — write-only CRUD
+# ============================================================================
+#
+# MyFitnessPal's fasting feature lives at /v2/diary/fasting_entry. It supports
+# POST (create), PATCH (update), and DELETE — but NOT GET. There is no public
+# read/list endpoint: the mobile app hydrates its Fasting History screen via a
+# delta-sync channel (mobile-sync-api.myfitnesspal.com/v2.1/sync) that requires
+# a pre-issued sync_token, is scoped to the mobile OAuth client, and rejects
+# the web-session bearer we authenticate with. See the README for details.
+#
+# Reads therefore stay in the MFP app; the MCP owns writes.
+#
+# Schema (matches what the iOS app sends, verified 2026-08-07):
+#     {
+#       "items": [
+#         {
+#           "type": "fasting_entry",
+#           "id": "UPPERCASE-UUID",
+#           "fast_started": "YYYY-MM-DDTHH:MM:SSZ",
+#           "fast_ended":   "YYYY-MM-DDTHH:MM:SSZ"
+#         }
+#       ]
+#     }
+
+
+_FASTING_ENDPOINT = f"{MFP_API_BASE}/v2/diary/fasting_entry"
+
+
+def _normalize_fasting_timestamp(ts: str) -> str:
+    """Normalize an ISO 8601 timestamp to MFP's form: `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+
+    Accepts naive strings (assumed UTC) and timezone-aware strings (converted
+    to UTC). Raises ValueError on anything that doesn't parse as ISO 8601.
+    """
+    # `datetime.fromisoformat` in Python 3.10 doesn't understand a trailing
+    # `Z`; swap it for `+00:00` first.
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(
+            f"Not an ISO 8601 timestamp: {ts!r} ({e})"
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _generate_fasting_id() -> str:
+    """Fresh uppercase UUIDv4 — matches the format the iOS app uses."""
+    return str(uuid.uuid4()).upper()
+
+
+def _build_fasting_payload(
+    entry_id: str, fast_started: str, fast_ended: str
+) -> Dict[str, Any]:
+    """Build the request body for POST/PATCH /v2/diary/fasting_entry.
+
+    Both timestamps are normalized to UTC ISO 8601 with a trailing `Z`, matching
+    the shape observed on the wire. Raises ValueError on invalid input:
+    missing id, unparseable timestamps, or end <= start.
+    """
+    if not entry_id:
+        raise ValueError("entry_id must be a non-empty string")
+    started = _normalize_fasting_timestamp(fast_started)
+    ended = _normalize_fasting_timestamp(fast_ended)
+    if ended <= started:
+        raise ValueError(
+            f"fast_ended ({ended}) must be strictly after fast_started ({started})"
+        )
+    return {
+        "items": [
+            {
+                "type": "fasting_entry",
+                "id": entry_id,
+                "fast_started": started,
+                "fast_ended": ended,
+            }
+        ]
+    }
+
+
+def create_fasting_entry(
+    client,
+    fast_started: str,
+    fast_ended: str,
+    entry_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """POST a new fasting entry. Returns the created record (with id + timestamps)."""
+    entry_id = entry_id or _generate_fasting_id()
+    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
+    response = client.session.post(
+        _FASTING_ENDPOINT,
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps(payload),
+        timeout=30,
+    )
+    if response.status_code != 201:
+        raise RuntimeError(
+            f"Failed to log fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    # Guard against a well-formed 201 whose body doesn't match the
+    # captured schema — surface a clear error instead of KeyError /
+    # IndexError bubbling up as "Error logging fast: 'items'".
+    try:
+        entry = response.json()["items"][0]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(
+            f"MFP returned HTTP 201 with an unexpected body: {response.text[:200]} ({e})"
+        ) from None
+    return {
+        "id": entry["id"],
+        "fast_started": entry["fast_started"],
+        "fast_ended": entry["fast_ended"],
+        "created_at": entry.get("created_at"),
+        "status": response.status_code,
+    }
+
+
+def update_fasting_entry(
+    client, entry_id: str, fast_started: str, fast_ended: str
+) -> Dict[str, Any]:
+    """PATCH an existing fasting entry. MFP's PATCH is a full replacement of
+    the two time fields — both must be sent, matching the iOS app's behavior."""
+    payload = _build_fasting_payload(entry_id, fast_started, fast_ended)
+    response = client.session.patch(
+        f"{_FASTING_ENDPOINT}/{entry_id}",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps(payload),
+        timeout=30,
+    )
+    if response.status_code != 204:
+        raise RuntimeError(
+            f"Failed to update fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    item = payload["items"][0]
+    return {
+        "id": entry_id,
+        "fast_started": item["fast_started"],
+        "fast_ended": item["fast_ended"],
+        "status": response.status_code,
+    }
+
+
+def delete_fasting_entry(client, entry_id: str) -> Dict[str, Any]:
+    """DELETE a fasting entry by id."""
+    if not entry_id:
+        raise ValueError("entry_id must be a non-empty string")
+    response = client.session.delete(
+        f"{_FASTING_ENDPOINT}/{entry_id}",
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 204:
+        raise RuntimeError(
+            f"Failed to delete fast: HTTP {response.status_code} — "
+            f"{_api_error_detail(response)}"
+        )
+    return {"id": entry_id, "deleted": True, "status": response.status_code}
+
+
+# UUID pattern for fasting-entry ids. Any 8-4-4-4-12 hex is accepted (the
+# endpoint doesn't strictly require v4), but leading/trailing whitespace and
+# non-hex characters are rejected up-front — otherwise garbage ids hit MFP
+# and come back as opaque 400s.
+_FASTING_ID_PATTERN = r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+
+
+class LogFastInput(BaseModel):
+    """Input for `mfp_log_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fast_started: str = Field(
+        description=(
+            "Fast start time as ISO 8601 (e.g. '2026-08-06T13:00:00Z'). Naive "
+            "timestamps are assumed UTC; timezone-aware ones are converted "
+            "to UTC."
+        ),
+    )
+    fast_ended: str = Field(
+        description="Fast end time, same format. Must be strictly after fast_started.",
+    )
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional UUID (8-4-4-4-12 hex) for the new entry. Auto-generated "
+            "as an uppercase v4 UUID if omitted, matching MFP's iOS convention."
+        ),
+        pattern=_FASTING_ID_PATTERN,
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class UpdateFastInput(BaseModel):
+    """Input for `mfp_update_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        description="UUID (8-4-4-4-12 hex) of the fasting entry to update.",
+        pattern=_FASTING_ID_PATTERN,
+    )
+    fast_started: str = Field(description="New start time (ISO 8601).")
+    fast_ended: str = Field(
+        description="New end time (ISO 8601). Must be strictly after fast_started."
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+class DeleteFastInput(BaseModel):
+    """Input for `mfp_delete_fast`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        description="UUID (8-4-4-4-12 hex) of the fasting entry to delete.",
+        pattern=_FASTING_ID_PATTERN,
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+@mcp.tool(
+    name="mfp_log_fast",
+    annotations={
+        "title": "Log Intermittent Fast",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def mfp_log_fast(params: LogFastInput) -> str:
+    """
+    Log a completed intermittent fasting window in MyFitnessPal.
+
+    Creates a new entry with the given start and end times. If `id` is
+    omitted, a fresh uppercase UUIDv4 is generated (matches how the iOS
+    app self-assigns ids). The returned `id` is what `mfp_update_fast` and
+    `mfp_delete_fast` accept — save it if you plan to modify the entry
+    later.
+
+    Args:
+        params: LogFastInput (fast_started, fast_ended, id?, response_format)
+
+    Returns:
+        str: The created entry with id, timestamps, created_at, and status
+    """
+    try:
+        client = get_mfp_client()
+        result = create_fasting_entry(
+            client, params.fast_started, params.fast_ended, params.id
+        )
+        return format_response(result, params.response_format, "Fast Logged")
+    except Exception as e:
+        return f"Error logging fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_update_fast",
+    annotations={
+        "title": "Update Fasting Entry",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_update_fast(params: UpdateFastInput) -> str:
+    """
+    Update an existing fasting entry's start and end times.
+
+    MFP's PATCH is a full replacement of the two time fields — both must be
+    supplied even if only one is changing.
+
+    The MCP cannot list fasts (MFP exposes no read endpoint); the `id` must
+    come from a prior `mfp_log_fast` call or be captured from the MFP app.
+
+    Args:
+        params: UpdateFastInput (id, fast_started, fast_ended, response_format)
+
+    Returns:
+        str: The updated entry (id, timestamps, status)
+    """
+    try:
+        client = get_mfp_client()
+        result = update_fasting_entry(
+            client, params.id, params.fast_started, params.fast_ended
+        )
+        return format_response(result, params.response_format, "Fast Updated")
+    except Exception as e:
+        return f"Error updating fast: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_delete_fast",
+    annotations={
+        "title": "Delete Fasting Entry",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_delete_fast(params: DeleteFastInput) -> str:
+    """
+    Delete a fasting entry by id.
+
+    Destructive and not recoverable. The `id` must come from a prior
+    `mfp_log_fast` call or be captured from the MFP app — the MCP cannot
+    list existing fasts because MFP exposes no read endpoint.
+
+    Args:
+        params: DeleteFastInput (id, response_format)
+
+    Returns:
+        str: Confirmation with the deleted id and HTTP status
+    """
+    try:
+        client = get_mfp_client()
+        result = delete_fasting_entry(client, params.id)
+        return format_response(result, params.response_format, "Fast Deleted")
+    except Exception as e:
+        return f"Error deleting fast: {str(e)}"
 
 
 def main():
