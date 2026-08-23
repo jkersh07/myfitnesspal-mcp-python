@@ -195,11 +195,7 @@ async def app(scope, receive, send):
         return
 
     if not _authorized(scope):
-        # Diagnostic (temporary): show what path the function actually saw,
-        # to pin down Vercel's rewrite behavior. Reveals nothing the caller
-        # didn't send.
-        seen = scope.get("path", "?")
-        await _reject(send, 401, f"Unauthorized. path-seen={seen}")
+        await _reject(send, 401, "Unauthorized.")
         return
 
     # Vercel routes every path to this function; the transport expects its own.
