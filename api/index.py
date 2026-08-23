@@ -110,7 +110,7 @@ mfp.get_mfp_client = get_mfp_client_remote
 # Built once per process and shared. This holds the tool registry.
 _MCP_SERVER = mfp.mcp._mcp_server
 
-_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
 
 def _new_session_manager() -> StreamableHTTPSessionManager:
@@ -179,7 +179,11 @@ async def app(scope, receive, send):
         return
 
     if not _authorized(scope):
-        await _reject(send, 401, "Unauthorized.")
+        # Diagnostic (temporary): show what path the function actually saw,
+        # to pin down Vercel's rewrite behavior. Reveals nothing the caller
+        # didn't send.
+        seen = scope.get("path", "?")
+        await _reject(send, 401, f"Unauthorized. path-seen={seen}")
         return
 
     # Vercel routes every path to this function; the transport expects its own.
