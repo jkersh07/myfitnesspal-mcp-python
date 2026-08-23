@@ -32,7 +32,9 @@ merge. Three things happen here.
    on a fixed date.
 
 Environment:
-    MCP_AUTH_TOKEN            required. Callers send it as a bearer token.
+    MCP_AUTH_TOKEN            required. Callers send it as a bearer token,
+                              or as the URL's first path segment for clients
+                              that cannot set headers (claude.ai connectors).
     UPSTASH_REDIS_REST_URL    required. See remote_store.
     UPSTASH_REDIS_REST_TOKEN  required.
 """
@@ -135,6 +137,14 @@ async def _reject(send, status: int, message: str) -> None:
 
 
 def _authorized(scope) -> bool:
+    """Accept the token as a bearer header OR as the first path segment.
+
+    The path form exists for claude.ai's custom-connector form, which sends
+    no Authorization header and offers only OAuth fields. A capability URL
+    (https://host/<token>/) is the standard fallback: the URL itself is the
+    secret, exactly like a webhook URL. Header auth stays for every client
+    that can send one.
+    """
     for name, value in scope.get("headers", []):
         if name == b"authorization":
             presented = value.decode(errors="ignore")
@@ -142,6 +152,9 @@ def _authorized(scope) -> bool:
             if not presented.startswith(prefix):
                 return False
             return hmac.compare_digest(presented[len(prefix):], _TOKEN)
+    first_segment = scope.get("path", "/").strip("/").split("/", 1)[0]
+    if first_segment:
+        return hmac.compare_digest(first_segment, _TOKEN)
     return False
 
 

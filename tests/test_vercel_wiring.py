@@ -121,6 +121,15 @@ def main():
     status4, _ = asyncio.run(call(HDRS + [AUTH], INIT, path="/api/index"))
     check("path normalized", status4 == 200, f"status {status4}")
 
+    # 6b. Capability URL: token as the first path segment, no auth header.
+    #     This is the claude.ai custom-connector path (its form cannot send
+    #     an Authorization header).
+    status5, body5 = asyncio.run(call(HDRS, INIT, path="/test-token-123/"))
+    check("token-in-path accepted", status5 == 200 and b"serverInfo" in body5, f"status {status5}")
+
+    status6, _ = asyncio.run(call(HDRS, INIT, path="/wrong-token/"))
+    check("wrong path token rejected", status6 == 401, f"status {status6}")
+
     # 7. No stored session gives a clear error, not a hang or a browser attempt.
     try:
         index.get_mfp_client_remote()

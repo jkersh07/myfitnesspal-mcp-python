@@ -69,10 +69,15 @@ manager per request, which is what stateless mode does internally anyway.
    browser, tests whichever it finds against MyFitnessPal before publishing, and
    refuses to publish one that does not work.
 
-5. **Register the connector** in claude.ai settings as a custom connector:
+5. **Register the connector** in claude.ai settings as a custom connector.
+   The claude.ai form cannot send custom headers (it only offers OAuth
+   fields), so the server also accepts the token as the URL's first path
+   segment - a capability URL, the webhook pattern:
 
-   - URL: `https://<your-deployment>.vercel.app/`
-   - Header: `Authorization: Bearer <MCP_AUTH_TOKEN>`
+   - URL: `https://<your-deployment>.vercel.app/<MCP_AUTH_TOKEN>/`
+
+   Clients that can send headers (Claude Code's .mcp.json, curl) may use
+   the plain root URL with `Authorization: Bearer <MCP_AUTH_TOKEN>` instead.
 
 ## Re-publishing a session
 
