@@ -1,0 +1,17 @@
+# Vercel installs from this file for the Python function in api/.
+#
+# This mirrors pyproject.toml rather than trimming it. An earlier version
+# dropped keyring and cryptography as desktop-only; server.py imports both at
+# module level (lines 33-34), so the function failed to start at all. They
+# import fine on Linux and are only *called* for Fernet-encrypted credentials,
+# which the hosted server never uses.
+#
+# browser-cookie3 is not listed because myfitnesspal depends on it directly,
+# so pip installs it regardless.
+mcp>=1.0.0,<2.0.0
+myfitnesspal>=2.0.0
+pydantic>=2.0.0
+httpx>=0.24.0
+pint>=0.22
+keyring>=24.0.0
+cryptography>=41.0.0
