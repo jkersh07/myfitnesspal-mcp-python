@@ -79,13 +79,22 @@ def collect_session() -> dict:
 
 
 def publish(cookies: dict) -> None:
-    url = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    url = (
+        os.environ.get("UPSTASH_REDIS_REST_URL")
+        or os.environ.get("KV_REST_API_URL")
+        or ""
+    ).rstrip("/")
+    token = (
+        os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        or os.environ.get("KV_REST_API_TOKEN")
+        or ""
+    )
     key = os.environ.get("MFP_COOKIE_KEY", "mfp:cookies")
 
     if not url or not token:
         sys.exit(
-            "Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN first.\n"
+            "Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN first\n"
+            "(Vercel's KV_REST_API_URL / KV_REST_API_TOKEN names also work).\n"
             "Both are on the storage database's page in the Vercel dashboard."
         )
 

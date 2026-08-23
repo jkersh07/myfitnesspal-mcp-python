@@ -43,12 +43,32 @@ class StoreNotConfigured(RuntimeError):
     pass
 
 
+def _rest_credentials() -> tuple[str, str]:
+    """The Upstash REST URL and token, under either naming scheme.
+
+    Upstash's own docs use UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN;
+    Vercel's marketplace integration injects the same values as
+    KV_REST_API_URL / KV_REST_API_TOKEN. Accept both, preferring the former.
+    """
+    url = (
+        os.environ.get("UPSTASH_REDIS_REST_URL")
+        or os.environ.get("KV_REST_API_URL")
+        or ""
+    ).rstrip("/")
+    token = (
+        os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        or os.environ.get("KV_REST_API_TOKEN")
+        or ""
+    )
+    return url, token
+
+
 def _config() -> tuple[str, str, str]:
-    url = os.environ.get("UPSTASH_REDIS_REST_URL", "").rstrip("/")
-    token = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+    url, token = _rest_credentials()
     if not url or not token:
         raise StoreNotConfigured(
-            "UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must both be set."
+            "Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN "
+            "(or Vercel's KV_REST_API_URL and KV_REST_API_TOKEN)."
         )
     return url, token, os.environ.get("MFP_COOKIE_KEY", DEFAULT_KEY)
 

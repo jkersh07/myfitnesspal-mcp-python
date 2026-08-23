@@ -43,9 +43,13 @@ manager per request, which is what stateless mode does internally anyway.
    | Name | Value |
    |---|---|
    | `MCP_AUTH_TOKEN` | any long random string you generate |
-   | `UPSTASH_REDIS_REST_URL` | from the store's page |
-   | `UPSTASH_REDIS_REST_TOKEN` | from the store's page |
+   | `UPSTASH_REDIS_REST_URL` | from the store's page (Vercel's auto-injected `KV_REST_API_URL` also works) |
+   | `UPSTASH_REDIS_REST_TOKEN` | from the store's page (`KV_REST_API_TOKEN` also works) |
    | `MFP_COOKIE_KEY` | optional, defaults to `mfp:cookies` |
+
+   Connecting the store to the project injects the two storage values
+   automatically under Vercel's `KV_*` names, so only `MCP_AUTH_TOKEN`
+   needs setting by hand.
 
    Without `MCP_AUTH_TOKEN` the endpoint refuses every request rather than
    serving an open URL that can write to a food diary.
